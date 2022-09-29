@@ -20,7 +20,8 @@ conda install matplotlib tensorboard --yes
 conda install numpy==1.19.4 --yes
 
 # PyTorch3D 0.4.0
-python -m pip install "git+https://github.com/facebookresearch/pytorch3d.git@v0.4.0"
+# python -m pip install "git+https://github.com/facebookresearch/pytorch3d.git@v0.4.0"
+pip install --no-index --no-cache-dir pytorch3d -f https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py38_cu113_pyt1110/download.html
 
 # Open3D 0.9 (Older version due to OS restrictions with RedHat)
 python -m pip install open3d==0.9
