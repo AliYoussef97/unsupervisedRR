@@ -8,7 +8,7 @@ from .video_dataset import VideoDataset
 # Define some important paths
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 RGBD_3D_ROOT = None  # -- You need to define those --
-SCANNET_ROOT = None  # -- You need to define those --
+SCANNET_ROOT = "datasets/scannet"  # -- You need to define those --
 
 
 def build_dataset(cfg, split, overfit=None):
