@@ -80,7 +80,6 @@ def get_grid(B: int, H: int, W: int):
     return grid_xyz
 
 
-@torch.jit.script
 def grid_to_pointcloud(
     K_inv,
     depth,
@@ -88,20 +87,39 @@ def grid_to_pointcloud(
     grid: Optional[torch.Tensor],
     downsampled: bool = False,
     match_feats: bool = False,
+    b_ids: Optional[torch.Tensor] = None,
 ):
     if match_feats and features is not None:
         B, _, H, W = features.shape
         depth = nn.functional.interpolate(
-            depth, (H, W), mode="bilinear", align_corners=True
+            depth,
+            (H, W),
+            mode="bilinear",
+            align_corners=True,
         )
     else:
         B, _, H, W = depth.shape
 
     if grid is None:
         grid = get_grid(B, H, W)
+        grid = grid.to(depth.device)
+
+    if grid.ndim == 2:
+        assert features is None
+        assert not downsampled
+        assert not match_feats
+        assert b_ids is not None
+        K_inv = K_inv[b_ids]
+
+    else:
+        assert grid.ndim == 4
 
     # Apply inverse projection
-    points = depth * grid
+    if grid.ndim == 2:
+        idx = grid.round().long()
+        points = depth[b_ids, 0, idx[:, 1], idx[:, 0]] * grid.T
+    else:
+        points = depth * grid
 
     if downsampled:
         points = nn.functional.avg_pool2d(points, 2, 2)
@@ -111,9 +129,16 @@ def grid_to_pointcloud(
         W = W // 2
 
     # Invert intriniscs
-    points = points.view(B, 3, H * W)
+    if grid.ndim == 2:  # Nx3
+        points = points.T
+        points = points.unsqueeze(-1)
+    else:
+        points = points.view(B, 3, H * W)
     points = K_inv.bmm(points)
-    points = points.permute(0, 2, 1)
+    if grid.ndim == 2:
+        points = points.squeeze(-1)
+    else:
+        points = points.permute(0, 2, 1)
 
     if features is not None:
         # convert

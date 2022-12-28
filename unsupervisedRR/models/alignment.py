@@ -25,8 +25,15 @@ def align(corres, P, Q, align_cfg, return_chamfer=False):
     corr_P_idx, corr_Q_idx, weights, _ = corres
 
     # get match features and coord
-    corr_P = nn_gather(P, corr_P_idx)
-    corr_Q = nn_gather(Q, corr_Q_idx)
+    if corr_P_idx.shape[1] == P.shape[1]:
+        corr_P = P
+    else:
+        corr_P = nn_gather(P, corr_P_idx)
+
+    if corr_Q_idx.shape[1] == Q.shape[1]:
+        corr_Q = Q
+    else:
+        corr_Q = nn_gather(Q, corr_Q_idx)
 
     Rt = randomized_weighted_procrustes(corr_P, corr_Q, weights, align_cfg)
 

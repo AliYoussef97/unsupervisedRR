@@ -7,7 +7,7 @@ from .abstract import AbstractDataset
 
 class VideoDataset(AbstractDataset):
     """
-        Dataset for video frames. It samples tuples of consecutive frames
+    Dataset for video frames. It samples tuples of consecutive frames
     """
 
     def __init__(self, cfg, root_path, data_dict, split):
@@ -24,7 +24,6 @@ class VideoDataset(AbstractDataset):
                 transforms.Resize(self.image_dim),
                 transforms.CenterCrop(self.image_dim),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5],),
             ]
         )
 

@@ -5,17 +5,28 @@ import random
 
 import open3d  # noqa: F401
 import torch
+
 from pytorch3d.loss import chamfer_distance
 from tqdm import tqdm
 
 from unsupervisedRR.configs import get_cfg_defaults
 from unsupervisedRR.datasets import build_loader
+
 from unsupervisedRR.models import build_model
 from unsupervisedRR.models.model_util import get_grid
 from unsupervisedRR.utils.metrics import evaluate_correspondances, evaluate_pose_Rt
 
 import numpy as np  # isort: skip || avoid open3d memory leak
 
+from silk.backbones.silk.silk import SiLKVGG, SiLKLoFTR
+from silk.backbones.superpoint.superpoint import SuperPoint as SuperPointBackbone
+
+from silk.backbones.unet.unet import UNet, ParametricUNet
+from silk.backbones.superpoint.vgg import ParametricVGG
+from silk.models.superpoint import SuperPoint
+from silk.config.model import load_model_from_checkpoint
+from silk.profiler import timeit
+from torchvision.transforms import functional as F
 
 # deterministic evaluation due to sampling in some methods
 seed = 77
@@ -35,7 +46,12 @@ def evaluate_split(model, data_loader, args, dict_name=None, use_tqdm=True):
     all_outputs = {}
 
     for batch in tqdm(data_loader, disable=not use_tqdm, dynamic_ncols=True):
-        batch_output, batch_metrics = forward_batch(model, batch)
+        with timeit(level="WARNING", message_template="forward batch: {duration}"):
+            batch_output, batch_metrics = forward_batch(model, batch)
+
+        for k, v in batch_metrics.items():
+            print(f"{k}: {v.squeeze().detach().cpu().numpy()}")
+
         for metric in batch_metrics:
             b_metric = batch_metrics[metric].detach().cpu()
             if metric in all_metrics:
@@ -129,14 +145,26 @@ def forward_batch(model, batch):
     gt_vps = [batch[f"Rt_{i}"].cuda() for i in range(num_views)]
     K = batch["K"].cuda()
 
-    output = model(gt_rgb, K=K, deps=gt_dep)
+    with timeit(level="WARNING", message_template="model forward: {duration}"):
+        output = model(gt_rgb, K=K, deps=gt_dep)
 
     metrics = {"instance_id": batch["uid"]}
 
     # Model outputs
     vp_1 = output["vp_1"]
     pr_pc = output["joint_pointcloud"]
-    gt_pc = model.generate_pointclouds(K, gt_dep, gt_vps)
+
+    if output["padding"] != 0:
+        gt_dep = [
+            dep[
+                ...,
+                output["padding"] : -output["padding"],
+                output["padding"] : -output["padding"],
+            ].contiguous()
+            for dep in gt_dep
+        ]
+
+    gt_pc = model.generate_pointclouds(K, gt_dep, gt_vps, padding=output["padding"])
 
     # Evaluate pose
     p_metrics = evaluate_pose_Rt(vp_1, gt_vps[1])
@@ -189,6 +217,7 @@ def forward_batch(model, batch):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=str)
+    parser.add_argument("--encoder", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--dataset", type=str, default="ScanNet")
     parser.add_argument("--split", type=str, default="test")
@@ -198,6 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_ratio", default=False, action="store_true")
     parser.add_argument("--point_ratio", default=None, type=float)
     parser.add_argument("--num_seeds", default=None, type=int)
+    parser.add_argument("--img_dim", default=None, type=int)
     args = parser.parse_args()
 
     # Dataset configs to be decided
@@ -207,11 +237,13 @@ if __name__ == "__main__":
     # Dataset Parameters
     dataset_cfg = default_cfg.DATASET
     dataset_cfg.name = args.dataset
-    dataset_cfg.batch_size = 4
+    dataset_cfg.batch_size = 1
+    if args.img_dim is not None:
+        dataset_cfg.img_dim = args.img_dim
     data_loader = build_loader(dataset_cfg, split=args.split)
 
     # Define model
-    if args.checkpoint is not None:
+    if (args.encoder is None) and (args.checkpoint is not None):
         checkpoint = torch.load(args.checkpoint)
         model_weights = checkpoint["model"]
         print(f"Loaded checkpoint from {args.checkpoint}")
@@ -248,9 +280,155 @@ if __name__ == "__main__":
     if args.point_ratio is not None:
         model_cfg.alignment.point_ratio = args.point_ratio
 
-    model = build_model(model_cfg).cuda()
+    if args.encoder == "silk":
+        encoder_type = "vgg"
+        if encoder_type == "resfpn":
+            # load model
+            backbone = SiLKLoFTR(
+                in_channels=1,
+                default_outputs="dense_descriptors",
+                descriptor_scale_factor=1.41,
+                padding=0,
+                resolution_preserving=False,
+            )
+        elif encoder_type == "vgg":
+            backbone = SiLKVGG(
+                in_channels=1,
+                default_outputs="dense_descriptors",
+                descriptor_scale_factor=1.41,
+                padding=0,
+                # padding=1,
+                backbone=ParametricVGG(
+                    normalization_fn=[
+                        torch.nn.BatchNorm2d(64),
+                        torch.nn.BatchNorm2d(64),
+                        torch.nn.BatchNorm2d(128),
+                        torch.nn.BatchNorm2d(128),
+                    ],
+                    use_max_pooling=False,
+                    padding=0,
+                    # padding=1,
+                    channels=(
+                        64,
+                        64,
+                        128,
+                        128,
+                    ),
+                )
+                ##### PVGG-tiny
+                # backbone=ParametricVGG(
+                #     normalization_fn=[torch.nn.BatchNorm2d(64)],
+                #     use_max_pooling=False,
+                #     padding=0,
+                #     channels=[64],
+                # ),
+                # lat_channels=32,
+                # desc_channels=32,
+                # feat_channels=64,
+                #####
+                # backbone=UNet(1, 128, bilinear=True),
+                # backbone=ParametricUNet(
+                #     1,
+                #     128,
+                #     input_feature_channels=16,
+                #     n_scales=4,
+                #     length=1,
+                #     bilinear=False,
+                #     use_max_pooling=True,
+                #     down_channels=[32, 64, 64, 64],
+                #     up_channels=[64, 64, 64, 128],
+                #     kernel=5,
+                #     padding=0,
+                # ),
+            )
 
-    if model_weights is not None:
+        def remove_prefix(str: str, prefix: str):
+            return str[len(prefix) :] if str.startswith(prefix) else str
+
+        backbone = load_model_from_checkpoint(
+            backbone,
+            checkpoint_path=args.checkpoint,
+            device="cuda:0",
+            freeze=True,
+            eval=True,
+            strict=True,
+            state_dict_fn=lambda x: {
+                remove_prefix(k, "_mods.model."): v for k, v in x.items()
+            },
+        ).cuda()
+
+        def encoder(x):
+            x = F.rgb_to_grayscale(x, num_output_channels=1)
+            x = backbone(x)
+            x /= 1.41
+            x = x.permute(0, 2, 1)
+            x = x.reshape(x.shape[0], x.shape[1], 128, 128)
+            return x
+
+    elif args.encoder == "superpoint":
+        MAGICLEAP = args.checkpoint.endswith("superpoint_v1.pth")
+
+        if MAGICLEAP:
+            use_batchnorm = False
+            state_dict_key = None
+            map_name = {
+                "conv1a.weight": "magicpoint.backbone._backbone.l1.0.0.weight",
+                "conv1a.bias": "magicpoint.backbone._backbone.l1.0.0.bias",
+                "conv1b.weight": "magicpoint.backbone._backbone.l1.1.0.weight",
+                "conv1b.bias": "magicpoint.backbone._backbone.l1.1.0.bias",
+                "conv2a.weight": "magicpoint.backbone._backbone.l2.0.0.weight",
+                "conv2a.bias": "magicpoint.backbone._backbone.l2.0.0.bias",
+                "conv2b.weight": "magicpoint.backbone._backbone.l2.1.0.weight",
+                "conv2b.bias": "magicpoint.backbone._backbone.l2.1.0.bias",
+                "conv3a.weight": "magicpoint.backbone._backbone.l3.0.0.weight",
+                "conv3a.bias": "magicpoint.backbone._backbone.l3.0.0.bias",
+                "conv3b.weight": "magicpoint.backbone._backbone.l3.1.0.weight",
+                "conv3b.bias": "magicpoint.backbone._backbone.l3.1.0.bias",
+                "conv4a.weight": "magicpoint.backbone._backbone.l4.0.0.weight",
+                "conv4a.bias": "magicpoint.backbone._backbone.l4.0.0.bias",
+                "conv4b.weight": "magicpoint.backbone._backbone.l4.1.0.weight",
+                "conv4b.bias": "magicpoint.backbone._backbone.l4.1.0.bias",
+                "convPa.weight": "magicpoint.backbone._heads._mods.logits._detH1.0.weight",
+                "convPa.bias": "magicpoint.backbone._heads._mods.logits._detH1.0.bias",
+                "convPb.weight": "magicpoint.backbone._heads._mods.logits._detH2.0.weight",
+                "convPb.bias": "magicpoint.backbone._heads._mods.logits._detH2.0.bias",
+                "convDa.weight": "magicpoint.backbone._heads._mods.raw_descriptors._desH1.0.weight",
+                "convDa.bias": "magicpoint.backbone._heads._mods.raw_descriptors._desH1.0.bias",
+                "convDb.weight": "magicpoint.backbone._heads._mods.raw_descriptors._desH2.0.weight",
+                "convDb.bias": "magicpoint.backbone._heads._mods.raw_descriptors._desH2.0.bias",
+            }
+        else:
+            use_batchnorm = True
+            state_dict_key = "state_dict"
+            map_name = None
+
+        backbone = SuperPointBackbone(
+            use_batchnorm=use_batchnorm,
+            default_outputs="upsampled_descriptors",
+        )
+
+        backbone = load_model_from_checkpoint(
+            backbone,
+            checkpoint_path=args.checkpoint,
+            freeze=True,
+            eval=True,
+            state_dict_key=state_dict_key,
+            map_name=map_name,
+        ).cuda()
+
+        def encoder(x):
+            x = F.rgb_to_grayscale(x, num_output_channels=1)
+            x = backbone(x)
+            return x
+
+    elif args.encoder is None:
+        encoder = None
+    else:
+        raise RuntimeError(f"unknown encoder {args.encoder}")
+
+    model = build_model(model_cfg, encoder=encoder).cuda()
+
+    if (args.encoder is None) and (model_weights is not None):
         model.load_state_dict(model_weights)
 
     evaluate_split(model, data_loader, args, args.save_dict, use_tqdm=args.progress_bar)

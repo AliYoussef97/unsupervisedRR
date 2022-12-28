@@ -1,11 +1,13 @@
 import torch
 
-from .model import PCReg
+from .model import PCReg, LoFTR
 
 
-def build_model(cfg):
+def build_model(cfg, encoder):
     if cfg.name == "PCReg":
-        model = PCReg(cfg)
+        model = PCReg(cfg, encoder)
+    elif cfg.name == "LoFTR":
+        model = LoFTR(cfg)
     elif cfg.name == "no_model":
         print("Warning: no model is being loaded; rarely correct thing to do")
         model = torch.nn.Identity()

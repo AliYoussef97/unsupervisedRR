@@ -2,7 +2,7 @@
 Code to find correspondances between two point clouds
 """
 import torch
-from pixenv.profiler import timeit
+from silk.profiler import timeit
 
 
 @torch.jit.script
