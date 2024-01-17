@@ -2,7 +2,6 @@
 Code to find correspondances between two point clouds
 """
 import torch
-from silk.profiler import timeit
 
 
 @torch.jit.script
@@ -109,10 +108,9 @@ def get_correspondences(
     # Calculate kNN for k=2; both outputs are (N, P, K)
     # idx_1 returns the indices of the nearest neighbor in P2
 
-    with timeit(level="WARNING", message_template="knn points: {duration}"):
-        similarity = P1 @ P2.permute(0, 2, 1)
-        top1 = similarity.topk(k=K, dim=2)
-        top2 = similarity.topk(k=K, dim=1)
+    similarity = P1 @ P2.permute(0, 2, 1)
+    top1 = similarity.topk(k=K, dim=2)
+    top2 = similarity.topk(k=K, dim=1)
 
     idx_1 = top1.indices
     idx_2 = top2.indices.permute(0, 2, 1)
@@ -129,13 +127,12 @@ def get_correspondences(
         dists_2 = cosine_2
 
     # Apply ratio test
-    with timeit(level="WARNING", message_template="ratio test: {duration}"):
-        if ratio_test:
-            weights_1 = calculate_ratio_test(dists_1)
-            weights_2 = calculate_ratio_test(dists_2)
-        else:
-            weights_1 = dists_1[:, :, 0:1]
-            weights_2 = dists_2[:, :, 0:1]
+    if ratio_test:
+        weights_1 = calculate_ratio_test(dists_1)
+        weights_2 = calculate_ratio_test(dists_2)
+    else:
+        weights_1 = dists_1[:, :, 0:1]
+        weights_2 = dists_2[:, :, 0:1]
 
     # find if both the points in the correspondace are valid
     valid_z1 = P1_X[:, :, 2] != 0
@@ -150,11 +147,10 @@ def get_correspondences(
     weights_2 = weights_2 * valid_2.unsqueeze(2)
 
     # Get topK matches in both directions
-    with timeit(level="WARNING", message_template="top k matches: {duration}"):
-        m12_idx1, m12_idx2, m12_dist = get_topk_matches(weights_1, idx_1, num_corres)
-        m21_idx2, m21_idx1, m21_dist = get_topk_matches(weights_2, idx_2, num_corres)
-        cosine_1 = cosine_1[:, :, 0:1].gather(1, m12_idx1)
-        cosine_2 = cosine_2[:, :, 0:1].gather(1, m21_idx2)
+    m12_idx1, m12_idx2, m12_dist = get_topk_matches(weights_1, idx_1, num_corres)
+    m21_idx2, m21_idx1, m21_dist = get_topk_matches(weights_2, idx_2, num_corres)
+    cosine_1 = cosine_1[:, :, 0:1].gather(1, m12_idx1)
+    cosine_2 = cosine_2[:, :, 0:1].gather(1, m21_idx2)
 
     # concatenate into correspondances and weights
     matches_idx1 = torch.cat((m12_idx1, m21_idx1), dim=1).squeeze(dim=2)

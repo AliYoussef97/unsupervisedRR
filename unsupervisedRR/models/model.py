@@ -8,7 +8,6 @@ from .backbones import ResNetDecoder, ResNetEncoder
 from .correspondence import get_correspondences
 from .model_util import get_grid, grid_to_pointcloud, points_to_ndc
 from .renderer import PointsRenderer
-from silk.profiler import timeit
 
 
 _DEBUG_MODE_ENABLED = False
@@ -181,11 +180,7 @@ class PCReg(nn.Module):
         output = {}
 
         # Encode features
-        with timeit(
-            level="WARNING",
-            message_template="feature computation: {duration}",
-        ):
-            feats = [self.encode(rgbs[i]) for i in range(n_views)]
+        feats = [self.encode(rgbs[i]) for i in range(n_views)]
 
         # generate pointclouds - generate grid once for efficience
         B, _, H, W = feats[0].shape
@@ -214,11 +209,11 @@ class PCReg(nn.Module):
         grid = grid.to(deps[0])
 
         K_inv = K.inverse()
-        with timeit(level="WARNING", message_template="grid to pointcloud: {duration}"):
-            pointclouds = [
-                grid_to_pointcloud(K_inv, deps[i], feats[i], grid)
-                for i in range(n_views)
-            ]
+
+        pointclouds = [
+            grid_to_pointcloud(K_inv, deps[i], feats[i], grid)
+            for i in range(n_views)
+        ]
         pcs_X = [pc[0] for pc in pointclouds]
         pcs_F = [pc[1] for pc in pointclouds]
 
@@ -226,60 +221,58 @@ class PCReg(nn.Module):
             # Drop first viewpoint -- assumed to be identity transformation
             vps = vps[1:]
         elif self.align_cfg.algorithm == "weighted_procrustes":
-            with timeit(
-                level="WARNING", message_template="get correspondences: {duration}"
-            ):
-                vps = []
-                cor_loss = []
-                for i in range(1, n_views):
-                    corr_i = get_correspondences(
-                        P1=pcs_F[0],
-                        P2=pcs_F[i],
-                        P1_X=pcs_X[0],
-                        P2_X=pcs_X[i],
-                        num_corres=self.num_corres,
-                        ratio_test=(self.align_cfg.base_weight == "nn_ratio"),
+            
+            vps = []
+            cor_loss = []
+            for i in range(1, n_views):
+                corr_i = get_correspondences(
+                    P1=pcs_F[0],
+                    P2=pcs_F[i],
+                    P1_X=pcs_X[0],
+                    P2_X=pcs_X[i],
+                    num_corres=self.num_corres,
+                    ratio_test=(self.align_cfg.base_weight == "nn_ratio"),
+                )
+
+                if _DEBUG_MODE_ENABLED:
+                    # for j in range(B):
+                    _debug_dump_images(
+                        rgbs[0],
+                        grid[0]
+                        .view(3, 128 * 128)
+                        .permute(1, 0)[..., [1, 0]][corr_i[0].squeeze(0)]
+                        .unsqueeze(0),
+                        "0",
+                    )
+                    _debug_dump_images(
+                        rgbs[i],
+                        grid[0]
+                        .view(3, 128 * 128)
+                        .permute(1, 0)[..., [1, 0]][corr_i[1].squeeze(0)]
+                        .unsqueeze(0),
+                        "1",
+                    )
+                    create_img_pair_visual(
+                        rgbs[0][0][:1],
+                        rgbs[i][0][:1],
+                        rgbs[0].shape[2],
+                        rgbs[0].shape[3],
+                        grid.view(3, 128 * 128).permute(1, 0)[..., [1, 0]][
+                            corr_i[0].squeeze(0)
+                        ],
+                        grid.view(3, 128 * 128).permute(1, 0)[..., [1, 0]][
+                            corr_i[1].squeeze(0)
+                        ],
                     )
 
-                    if _DEBUG_MODE_ENABLED:
-                        # for j in range(B):
-                        _debug_dump_images(
-                            rgbs[0],
-                            grid[0]
-                            .view(3, 128 * 128)
-                            .permute(1, 0)[..., [1, 0]][corr_i[0].squeeze(0)]
-                            .unsqueeze(0),
-                            "0",
-                        )
-                        _debug_dump_images(
-                            rgbs[i],
-                            grid[0]
-                            .view(3, 128 * 128)
-                            .permute(1, 0)[..., [1, 0]][corr_i[1].squeeze(0)]
-                            .unsqueeze(0),
-                            "1",
-                        )
-                        create_img_pair_visual(
-                            rgbs[0][0][:1],
-                            rgbs[i][0][:1],
-                            rgbs[0].shape[2],
-                            rgbs[0].shape[3],
-                            grid.view(3, 128 * 128).permute(1, 0)[..., [1, 0]][
-                                corr_i[0].squeeze(0)
-                            ],
-                            grid.view(3, 128 * 128).permute(1, 0)[..., [1, 0]][
-                                corr_i[1].squeeze(0)
-                            ],
-                        )
+                Rt_i, cor_loss_i = align(corr_i, pcs_X[0], pcs_X[i], self.align_cfg)
 
-                    Rt_i, cor_loss_i = align(corr_i, pcs_X[0], pcs_X[i], self.align_cfg)
+                vps.append(Rt_i)
+                cor_loss.append(cor_loss_i)
 
-                    vps.append(Rt_i)
-                    cor_loss.append(cor_loss_i)
-
-                    # add for visualization
-                    output[f"corres_0{i}"] = corr_i
-                    output[f"vp_{i}"] = Rt_i
+                # add for visualization
+                output[f"corres_0{i}"] = corr_i
+                output[f"vp_{i}"] = Rt_i
         else:
             raise ValueError(f"How to align using {self.align_cfg.algorithm}?")
 
@@ -306,39 +299,36 @@ class PCReg(nn.Module):
             pcs_FRGB_joint = torch.cat((pcs_F_joint, pcs_RGB_joint), dim=2)
 
         # Rasterize and Blend
-        with timeit(
-            level="WARNING", message_template="rasterize and blend: {duration}"
-        ):
-            for i in range(n_views):
-                if self.pointcloud_source == "other":
-                    # get joint for all values except the one
-                    pcs_X_joint = torch.cat(pcs_X[0:i] + pcs_X[i + 1 : n_views], dim=1)
-                    pcs_F_joint = torch.cat(pcs_F[0:i] + pcs_F[i + 1 : n_views], dim=1)
-                    pcs_RGB_joint = torch.cat(
-                        pcs_rgb[0:i] + pcs_rgb[i + 1 : n_views], dim=1
-                    )
-                    pcs_FRGB_joint = torch.cat((pcs_F_joint, pcs_RGB_joint), dim=2)
+        
+        for i in range(n_views):
+            if self.pointcloud_source == "other":
+                # get joint for all values except the one
+                pcs_X_joint = torch.cat(pcs_X[0:i] + pcs_X[i + 1 : n_views], dim=1)
+                pcs_F_joint = torch.cat(pcs_F[0:i] + pcs_F[i + 1 : n_views], dim=1)
+                pcs_RGB_joint = torch.cat(
+                    pcs_rgb[0:i] + pcs_rgb[i + 1 : n_views], dim=1
+                )
+                pcs_FRGB_joint = torch.cat((pcs_F_joint, pcs_RGB_joint), dim=2)
 
-                if i > 0:
-                    rot_joint_X = transform_points_Rt(pcs_X_joint, vps[i - 1])
-                    rot_joint_X = points_to_ndc(rot_joint_X, K, (H, W))
-                else:
-                    rot_joint_X = points_to_ndc(pcs_X_joint, K, (H, W))
-                projs.append(self.renderer(rot_joint_X, pcs_FRGB_joint))
+            if i > 0:
+                rot_joint_X = transform_points_Rt(pcs_X_joint, vps[i - 1])
+                rot_joint_X = points_to_ndc(rot_joint_X, K, (H, W))
+            else:
+                rot_joint_X = points_to_ndc(pcs_X_joint, K, (H, W))
+            projs.append(self.renderer(rot_joint_X, pcs_FRGB_joint))
 
         # Decode
-        with timeit(level="WARNING", message_template="decode: {duration}"):
-            for i in range(n_views):
-                proj_FRGB_i = projs[i]["feats"]
-                proj_RGB_i = proj_FRGB_i[:, -3:]
-                proj_F_i = proj_FRGB_i[:, :-3]
+        for i in range(n_views):
+            proj_FRGB_i = projs[i]["feats"]
+            proj_RGB_i = proj_FRGB_i[:, -3:]
+            proj_F_i = proj_FRGB_i[:, :-3]
 
-                if self.decode:
-                    output[f"rgb_decode_{i}"] = self.decode(proj_F_i)
+            if self.decode:
+                output[f"rgb_decode_{i}"] = self.decode(proj_F_i)
 
-                output[f"rgb_render_{i}"] = proj_RGB_i
-                output[f"ras_depth_{i}"] = projs[i]["depth"]
-                output[f"cover_{i}"] = projs[i]["mask"].unsqueeze(1)  # useless
+            output[f"rgb_render_{i}"] = proj_RGB_i
+            output[f"ras_depth_{i}"] = projs[i]["depth"]
+            output[f"cover_{i}"] = projs[i]["mask"].unsqueeze(1)  # useless
 
         return output
 
@@ -532,46 +522,44 @@ class LoFTR(nn.Module):
         pts1 = torch.cat((pts1, _1), dim=1)
 
         K_inv = K.inverse()
-        with timeit(level="WARNING", message_template="grid to pointcloud: {duration}"):
-            pointclouds = [
-                grid_to_pointcloud(K_inv, deps[0], None, pts0, b_ids=b_ids),
-                grid_to_pointcloud(K_inv, deps[1], None, pts1, b_ids=b_ids),
-            ]
+
+        pointclouds = [
+            grid_to_pointcloud(K_inv, deps[0], None, pts0, b_ids=b_ids),
+            grid_to_pointcloud(K_inv, deps[1], None, pts1, b_ids=b_ids),
+        ]
         pcs_X = [pc[0] for pc in pointclouds]
         pcs_F = [pc[1] for pc in pointclouds]
 
-        with timeit(
-            level="WARNING", message_template="get correspondences: {duration}"
-        ):
-            vps = []
-            cor_loss = []
-            for i in range(1, n_views):
-                Rt_i = []
-                cor_loss_i = []
-                for b in range(B):
-                    mask = b_ids == b
-                    corr_i = (
-                        i_ids[mask].unsqueeze(0),
-                        j_ids[mask].unsqueeze(0),
-                        mconf[mask].unsqueeze(0),
-                        None,
-                    )
-                    pX0 = pcs_X[0][mask].unsqueeze(0)
-                    pX1 = pcs_X[i][mask].unsqueeze(0)
+        
+        vps = []
+        cor_loss = []
+        for i in range(1, n_views):
+            Rt_i = []
+            cor_loss_i = []
+            for b in range(B):
+                mask = b_ids == b
+                corr_i = (
+                    i_ids[mask].unsqueeze(0),
+                    j_ids[mask].unsqueeze(0),
+                    mconf[mask].unsqueeze(0),
+                    None,
+                )
+                pX0 = pcs_X[0][mask].unsqueeze(0)
+                pX1 = pcs_X[i][mask].unsqueeze(0)
 
-                    Rt_i_, cor_loss_i_ = align(corr_i, pX0, pX1, self.align_cfg)
+                Rt_i_, cor_loss_i_ = align(corr_i, pX0, pX1, self.align_cfg)
 
-                    Rt_i.append(Rt_i_)
-                    cor_loss_i.append(cor_loss_i_)
+                Rt_i.append(Rt_i_)
+                cor_loss_i.append(cor_loss_i_)
 
-                Rt_i = torch.cat(Rt_i)
-                cor_loss_i = torch.cat(cor_loss_i)
+            Rt_i = torch.cat(Rt_i)
+            cor_loss_i = torch.cat(cor_loss_i)
 
-                vps.append(Rt_i)
-                cor_loss.append(cor_loss_i)
+            vps.append(Rt_i)
+            cor_loss.append(cor_loss_i)
 
-                # add for visualization
-                output[f"vp_{i}"] = Rt_i
+            # add for visualization
+            output[f"vp_{i}"] = Rt_i
 
         pointclouds = [
             grid_to_pointcloud(K_inv, deps[0], None, None),
